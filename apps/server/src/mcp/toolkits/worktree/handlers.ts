@@ -43,6 +43,15 @@ const handlers = {
       return yield* service.handoff(scope, input);
     }),
   ),
+  t3_worktree_attach: McpToolAccess.writesThreads(
+    (input) => [input.threadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* WorktreeMcpService.WorktreeMcpService;
+        return yield* service.attach(scope, input);
+      }),
+  ),
   t3_worktree_status: McpToolAccess.readsAsCaller(() =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

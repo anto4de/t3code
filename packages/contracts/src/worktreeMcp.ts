@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 /** Uses the managed worktree folder; handoff detaches the provider, ending this turn and resuming there next run. */
 export const WorktreeMcpHandoffInput = Schema.Struct({
@@ -73,6 +73,23 @@ export const WorktreeMcpHandoffResult = Schema.Struct({
   note: Schema.String,
 });
 export type WorktreeMcpHandoffResult = typeof WorktreeMcpHandoffResult.Type;
+
+export const WorktreeMcpAttachInput = Schema.Struct({
+  threadId: Schema.optional(ThreadId),
+  branch: TrimmedNonEmptyString.annotate({
+    description: "Branch checked out in the target worktree.",
+  }),
+});
+export type WorktreeMcpAttachInput = typeof WorktreeMcpAttachInput.Type;
+
+export const WorktreeMcpAttachResult = Schema.Struct({
+  threadId: ThreadId,
+  worktreePath: Schema.NullOr(TrimmedNonEmptyString).annotate({
+    description: "Null: the project root.",
+  }),
+  branch: TrimmedNonEmptyString,
+});
+export type WorktreeMcpAttachResult = typeof WorktreeMcpAttachResult.Type;
 
 export const WorktreeMcpStatusResult = Schema.Struct({
   attached: Schema.Boolean,

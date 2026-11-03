@@ -2,7 +2,10 @@ import {
   CommandId,
   MessageId,
   type ProjectId,
+  type ThreadId,
   WorktreeMcpFailure,
+  type WorktreeMcpAttachInput,
+  type WorktreeMcpAttachResult,
   type WorktreeMcpContinuationStatus,
   type WorktreeMcpHandoffInput,
   type WorktreeMcpHandoffResult,
@@ -13,6 +16,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
@@ -31,6 +35,10 @@ export class WorktreeMcpService extends Context.Service<
       scope: McpInvocationScope,
       input: WorktreeMcpHandoffInput,
     ) => Effect.Effect<WorktreeMcpHandoffResult, WorktreeMcpFailure>;
+    readonly attach: (
+      scope: McpInvocationScope,
+      input: WorktreeMcpAttachInput,
+    ) => Effect.Effect<WorktreeMcpAttachResult, WorktreeMcpFailure>;
     readonly status: (
       scope: McpInvocationScope,
     ) => Effect.Effect<WorktreeMcpStatusResult, WorktreeMcpFailure>;
@@ -62,6 +70,7 @@ const make = Effect.gen(function* () {
   const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
   const setupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+  const fileSystem = yield* FileSystem.FileSystem;
 
   // Serialize handoffs per thread to avoid creating two worktrees and orphaning one.
   const handoffThreadsInFlight = new Set<string>();
@@ -83,23 +92,23 @@ const make = Effect.gen(function* () {
           failure("capability_denied", "This MCP credential does not grant worktree capabilities."),
         );
 
-  const loadThread = (scope: McpThreadInvocationScope) =>
-    threadManagement.getThreadRecords(scope.thread.threadId, []).pipe(
+  const loadThread = (threadId: ThreadId) =>
+    threadManagement.getThreadRecords(threadId, []).pipe(
       Effect.mapError((error) =>
         error._tag === "OrchestratorProjectionError"
-          ? failure("thread_not_found", `Thread '${scope.thread.threadId}' was not found.`)
+          ? failure("thread_not_found", `Thread '${threadId}' was not found.`)
           : failure(
               "operation_failed",
-              `Unable to read thread ${scope.thread.threadId}: ${errorMessage(error)}`,
+              `Unable to read thread ${threadId}: ${errorMessage(error)}`,
             ),
       ),
       Effect.filterOrFail(
         (projection) => projection.thread.deletedAt === null,
-        () => failure("thread_not_found", `Thread '${scope.thread.threadId}' was not found.`),
+        () => failure("thread_not_found", `Thread '${threadId}' was not found.`),
       ),
     );
 
-  const loadProject = (scope: McpThreadInvocationScope, projectId: ProjectId) =>
+  const loadProject = (threadId: ThreadId, projectId: ProjectId) =>
     projects.getById(projectId).pipe(
       asOperationFailed(`Unable to read project ${projectId}`),
       Effect.flatMap(
@@ -108,7 +117,7 @@ const make = Effect.gen(function* () {
             Effect.fail(
               failure(
                 "project_not_found",
-                `Project '${projectId}' was not found for thread '${scope.thread.threadId}'.`,
+                `Project '${projectId}' was not found for thread '${threadId}'.`,
               ),
             ),
           onSome: Effect.succeed,
@@ -147,7 +156,7 @@ const make = Effect.gen(function* () {
         `Thread '${scope.thread.threadId}' is already attached to worktree '${worktreePath}'.`,
       );
 
-    const projection = yield* loadThread(scope);
+    const projection = yield* loadThread(scope.thread.threadId);
     if (projection.thread.worktreePath !== null) {
       return yield* alreadyInWorktree(projection.thread.worktreePath);
     }
@@ -158,7 +167,7 @@ const make = Effect.gen(function* () {
       );
     }
 
-    const project = yield* loadProject(scope, projection.thread.projectId);
+    const project = yield* loadProject(scope.thread.threadId, projection.thread.projectId);
     const projectCwd = project.workspaceRoot;
 
     const localStatus = yield* gitWorkflow
@@ -265,7 +274,7 @@ const make = Effect.gen(function* () {
 
         const recheckAndBind = Effect.gen(function* () {
           // A concurrent UI binding may have landed during git work; do not orphan a second worktree.
-          const recheck = yield* loadThread(scope);
+          const recheck = yield* loadThread(scope.thread.threadId);
           if (recheck.thread.worktreePath !== null) {
             return yield* alreadyInWorktree(recheck.thread.worktreePath);
           }
@@ -408,12 +417,66 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const attach: WorktreeMcpService["Service"]["attach"] = Effect.fn("WorktreeMcpService.attach")(
+    function* (scope, input) {
+      yield* requireCapability(scope);
+      const threadId = input.threadId ?? scope.thread?.threadId;
+      if (threadId === undefined) {
+        return yield* failure(
+          "invalid_request",
+          "Pass threadId: this MCP client is not running inside a T3 thread.",
+        );
+      }
+      const projection = yield* loadThread(threadId);
+      const project = yield* loadProject(threadId, projection.thread.projectId);
+      const ref = yield* gitWorkflow
+        .listRefs({ cwd: project.workspaceRoot, query: input.branch, refKind: "local" })
+        .pipe(
+          asOperationFailed("Unable to list branches"),
+          Effect.map((result) =>
+            result.refs.find((ref) => ref.name === input.branch && ref.isRemote !== true),
+          ),
+        );
+      if (!ref?.worktreePath) {
+        return yield* failure(
+          "invalid_request",
+          `Branch '${input.branch}' is not checked out in any worktree of this project. t3_worktree_list shows checkouts.`,
+        );
+      }
+      const real = (path: string) =>
+        fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+      const worktreePath =
+        (yield* real(ref.worktreePath)) === (yield* real(project.workspaceRoot))
+          ? null
+          : ref.worktreePath;
+      yield* threadManagement
+        .dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make(
+            [
+              "command",
+              "mcp",
+              encodeURIComponent(scope.requestNamespace),
+              "worktree-attach",
+              yield* random.uuidV4().pipe(Effect.orDie),
+            ].join(":"),
+          ),
+          threadId,
+          branch: ref.name,
+          worktreePath,
+          expectedWorktreePath: projection.thread.worktreePath,
+        })
+        .pipe(asOperationFailed("Unable to re-point the thread"));
+      return { threadId, worktreePath, branch: ref.name };
+    },
+  );
+
   const status: WorktreeMcpService["Service"]["status"] = Effect.fn("WorktreeMcpService.status")(
     function* (callerScope) {
       yield* requireCapability(callerScope);
       const scope = yield* requireThreadScope(callerScope);
-      const projection = yield* loadThread(scope);
-      const project = yield* loadProject(scope, projection.thread.projectId);
+      const projection = yield* loadThread(scope.thread.threadId);
+      const project = yield* loadProject(scope.thread.threadId, projection.thread.projectId);
 
       const defaultStartFromOrigin = yield* readDefaultStartFromOrigin;
 
@@ -428,7 +491,7 @@ const make = Effect.gen(function* () {
     },
   );
 
-  return WorktreeMcpService.of({ handoff, status });
+  return WorktreeMcpService.of({ handoff, attach, status });
 });
 
 export const layer: Layer.Layer<
@@ -441,4 +504,5 @@ export const layer: Layer.Layer<
   | GitWorkflowService.GitWorkflowService
   | ProjectSetupScriptRunner.ProjectSetupScriptRunner
   | VcsStatusBroadcaster.VcsStatusBroadcaster
+  | FileSystem.FileSystem
 > = Layer.effect(WorktreeMcpService, make);

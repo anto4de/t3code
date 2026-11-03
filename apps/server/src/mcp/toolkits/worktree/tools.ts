@@ -4,6 +4,8 @@ import {
   OrchestratorMcpFailure,
   VcsListRefsInput,
   VcsListRefsResult,
+  WorktreeMcpAttachInput,
+  WorktreeMcpAttachResult,
   WorktreeMcpHandoffInput,
   WorktreeMcpHandoffResult,
   WorktreeMcpStatusResult,
@@ -40,6 +42,21 @@ const WorktreeHandoffTool = Tool.make("t3_worktree_handoff", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false)
   .annotate(Tool.OpenWorld, true);
+
+const WorktreeAttachTool = Tool.make("t3_worktree_attach", {
+  description:
+    "Re-point a thread at the project worktree where `branch` is checked out, e.g. after `git worktree move` or a branch rename. Omit `threadId` for this thread; then call last in your turn, as the move ends the live session.",
+  parameters: WorktreeMcpAttachInput,
+  success: WorktreeMcpAttachResult,
+  failure: WorktreeToolFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Attach thread to an existing git worktree")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false);
 
 const WorktreeStatusTool = Tool.make("t3_worktree_status", {
   description:
@@ -85,6 +102,7 @@ const WorktreeListTool = Tool.make("t3_worktree_list", {
   .annotate(Tool.Destructive, false);
 export const WorktreeToolkit = Toolkit.make(
   WorktreeHandoffTool,
+  WorktreeAttachTool,
   WorktreeStatusTool,
   WorktreeListTool,
 );

@@ -93,6 +93,8 @@ interface HarnessOptions {
   readonly thread?: ThreadFixture | null;
   readonly threadReadError?: "projection" | "dispatch";
   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
+  readonly outsideThread?: boolean;
+  readonly projectWorkspaceRoot?: string;
   readonly currentBranch?: string | null;
   readonly notARepo?: boolean;
   readonly newWorktreesStartFromOrigin?: boolean;
@@ -118,7 +120,8 @@ interface HarnessOptions {
 
 const makeHarness = (options: HarnessOptions = {}) => {
   const thread = options.thread === undefined ? {} : options.thread;
-  const scope = makeScope(options.capabilities ?? new Set(["preview", "worktree"]));
+  const threadScope = makeScope(options.capabilities ?? new Set(["preview", "worktree"]));
+  const scope = options.outsideThread ? { ...threadScope, thread: undefined } : threadScope;
   const dispatch = vi.fn((_: unknown) =>
     (options.dispatchGate ?? Effect.void).pipe(
       Effect.andThen(
@@ -197,7 +200,10 @@ const makeHarness = (options: HarnessOptions = {}) => {
       ? (Effect.fail("simulated project read failure") as never)
       : Effect.succeed(
           id === projectId && options.projectMissing !== true
-            ? Option.some(project)
+            ? Option.some({
+                ...project,
+                workspaceRoot: options.projectWorkspaceRoot ?? workspaceRoot,
+              })
             : Option.none(),
         ),
   );
@@ -688,6 +694,73 @@ describe("t3_worktree_status", () => {
         branch: "feature/existing",
         defaultStartFromOrigin: false,
       });
+    });
+  });
+});
+
+describe("t3_worktree_attach", () => {
+  const runAttach = (harness: ReturnType<typeof makeHarness>, branch: string, target?: ThreadId) =>
+    Effect.gen(function* () {
+      const service = yield* WorktreeMcpService.WorktreeMcpService;
+      return yield* service.attach(harness.scope, { branch, threadId: target });
+    }).pipe(Effect.provide(harness.layer));
+
+  it.effect.each([
+    { checkout: "/worktrees/moved", worktreePath: "/worktrees/moved" },
+    { checkout: workspaceRoot, worktreePath: null },
+  ])("re-points a thread at the checkout git reports ($checkout)", ({ checkout, worktreePath }) => {
+    const harness = makeHarness({
+      thread: { branch: "t3/old", worktreePath: "/worktrees/old" },
+      existingBranchWorktreePath: checkout,
+    });
+    return Effect.gen(function* () {
+      const result = yield* runAttach(harness, "we-1-renamed");
+      expect(result).toEqual({ threadId, worktreePath, branch: "we-1-renamed" });
+      expect(harness.dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "thread.metadata.update",
+          threadId,
+          branch: "we-1-renamed",
+          worktreePath,
+          expectedWorktreePath: "/worktrees/old",
+        }),
+      );
+    });
+  });
+
+  it.effect("re-points a named thread from a client outside any thread", () => {
+    const harness = makeHarness({ outsideThread: true, existingBranchWorktreePath: "/wt/moved" });
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(runAttach(harness, "we-1"));
+      expectTypedFailure(exit, { _tag: "WorktreeMcpFailure", code: "invalid_request" });
+      const result = yield* runAttach(harness, "we-1", threadId);
+      expect(result).toEqual({ threadId, worktreePath: "/wt/moved", branch: "we-1" });
+      expect(harness.dispatch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it.effect("treats a symlinked spelling of the project root as the root", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+      const root = `${directory}/root`;
+      yield* fs.makeDirectory(root);
+      yield* fs.symlink(root, `${directory}/link`);
+      const harness = makeHarness({
+        projectWorkspaceRoot: `${directory}/link`,
+        existingBranchWorktreePath: root,
+      });
+      const result = yield* runAttach(harness, "main");
+      expect(result.worktreePath).toBeNull();
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rejects a branch that no worktree has checked out", () => {
+    const harness = makeHarness({ existingBranchWorktreePath: null });
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(runAttach(harness, "feature/nowhere"));
+      expectTypedFailure(exit, { _tag: "WorktreeMcpFailure", code: "invalid_request" });
+      expect(harness.dispatch).not.toHaveBeenCalled();
     });
   });
 });
